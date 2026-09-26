@@ -31,25 +31,54 @@ function updateProgress(percent) {
   if (p >= 100) progressLabel.textContent = "Hoàn tất";
 }
 
-function parseSseChunk(text, onProgress, onDone, onJson) {
-  const lines = text.split("\n");
-  for (const line of lines) {
-    if (!line.startsWith("data:")) continue;
-    const data = line.replace(/^data:\s?/, "").trim();
-    if (!data) continue;
-    if (data.startsWith("PROGRESS:")) {
-      const pct = parseFloat(data.slice(9));
-      if (!Number.isNaN(pct)) onProgress(pct);
-    } else if (data.startsWith("DONE:")) {
-      onDone(data.slice(5));
-    } else if (data.startsWith("{")) {
-      try {
-        onJson(JSON.parse(data));
-      } catch (_) {
-        /* ignore non-json */
-      }
-    }
+function forceDownload(blobOrUrl, filename) {
+  const a = document.createElement("a");
+  a.style.display = "none";
+  a.download = filename || "download";
+  if (typeof blobOrUrl === "string") {
+    a.href = blobOrUrl;
+  } else {
+    a.href = URL.createObjectURL(blobOrUrl);
   }
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    if (typeof blobOrUrl !== "string") URL.revokeObjectURL(a.href);
+    a.remove();
+  }, 1500);
+}
+
+async function downloadViaProxy(mediaUrl, filename, format) {
+  // Stream through our API so Content-Disposition forces save on PC + mobile
+  const proxy =
+    "/api/download?proxy=1&url=" +
+    encodeURIComponent(mediaUrl) +
+    "&name=" +
+    encodeURIComponent(filename) +
+    "&format=" +
+    encodeURIComponent(format);
+
+  updateProgress(40);
+  progressLabel.textContent = "Đang tải file...";
+
+  const res = await fetch(proxy, { method: "GET" });
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = JSON.parse(text);
+      msg = j.error || msg;
+    } catch (_) {
+      if (text) msg = text.slice(0, 180);
+    }
+    throw new Error(msg);
+  }
+
+  updateProgress(85);
+  const blob = await res.blob();
+  updateProgress(98);
+  forceDownload(blob, filename);
+  return true;
 }
 
 async function download(format) {
@@ -67,8 +96,8 @@ async function download(format) {
   }
 
   setLoading(true);
-  setStatus("Đang tải qua media_downloader.py...", "info");
-  updateProgress(5);
+  setStatus("Đang lấy link tải...", "info");
+  updateProgress(8);
 
   try {
     const response = await fetch("/api/download", {
@@ -77,94 +106,38 @@ async function download(format) {
       body: JSON.stringify({ url, format }),
     });
 
-    if (!response.ok) {
-      // try text first — may be SSE error or JSON
-      const text = await response.text();
-      let msg = `HTTP ${response.status}`;
-      try {
-        const j = JSON.parse(text);
-        msg = j.error || msg;
-      } catch (_) {
-        if (text) msg = text.slice(0, 200);
-      }
-      throw new Error(msg);
-    }
-
+    const text = await response.text();
     let finalData = null;
-    const contentType = (response.headers.get("content-type") || "").toLowerCase();
-
-    if (contentType.includes("text/event-stream") || contentType.includes("text/plain")) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        // process complete lines only
-        const parts = buffer.split("\n");
-        buffer = parts.pop() || "";
-        parseSseChunk(
-          parts.join("\n"),
-          (pct) => updateProgress(pct),
-          () => updateProgress(95),
-          (obj) => {
-            finalData = obj;
-          }
-        );
-      }
-      // flush remaining
-      if (buffer.trim()) {
-        parseSseChunk(
-          buffer,
-          (pct) => updateProgress(pct),
-          () => updateProgress(95),
-          (obj) => {
-            finalData = obj;
-          }
-        );
-      }
-    } else {
-      const text = await response.text();
-      try {
-        finalData = JSON.parse(text);
-      } catch (_) {
-        // maybe SSE without proper content-type
-        parseSseChunk(
-          text,
-          (pct) => updateProgress(pct),
-          () => updateProgress(95),
-          (obj) => {
-            finalData = obj;
-          }
-        );
-      }
+    try {
+      finalData = JSON.parse(text);
+    } catch (_) {
+      throw new Error(text.slice(0, 200) || `HTTP ${response.status}`);
     }
 
-    if (!finalData || !finalData.success) {
-      throw new Error((finalData && finalData.error) || "Tải thất bại — không nhận được kết quả JSON");
+    if (!response.ok || !finalData || !finalData.success) {
+      throw new Error(
+        (finalData && (finalData.error || finalData.hint)) ||
+          `HTTP ${response.status}`
+      );
     }
 
-    updateProgress(100);
+    updateProgress(30);
 
-    const link = finalData.download_url || finalData.url;
+    const mediaUrl = finalData.download_url || finalData.url;
     const name = finalData.filename
       ? finalData.filename.split(/[/\\]/).pop()
       : "download." + format;
 
-    if (link) {
-      const a = document.createElement("a");
-      a.href = link;
-      a.download = name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+    if (!mediaUrl) {
+      throw new Error("Không nhận được link media");
     }
 
+    // Proxy stream → blob → force download (PC + mobile)
+    await downloadViaProxy(mediaUrl, name, format);
+
+    updateProgress(100);
     setStatus(
-      `Tải thành công: ${name}` + (finalData.codec === "h264" ? " (H.264)" : ""),
+      `Đã tải: ${name}` + (finalData.codec === "h264" ? " (H.264)" : ""),
       "success"
     );
   } catch (err) {
