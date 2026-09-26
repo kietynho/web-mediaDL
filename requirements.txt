@@ -1,0 +1,1 @@
+# No heavy deps — pure stdlib for Vercel serverless
