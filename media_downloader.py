@@ -1,52 +1,96 @@
 #!/usr/bin/env python3
-"""
-Media Downloader Tool
-yt-dlp + ffmpeg. ALWAYS re-encodes video to H.264 + AAC for Windows.
-
-Usage:
-  python media_downloader.py <url> --format mp4
-  python media_downloader.py <url> --format mp3
-"""
+# fetch.py — local YouTube/TikTok downloader. clean TUI + CLI.
+# deps:  pip install -U yt-dlp rich
+# needs: ffmpeg on PATH (hoặc thả folder ffmpeg cạnh file này)
+from __future__ import annotations
 
 import argparse
-import sys
 import os
-import json
+import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 try:
     import yt_dlp
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import (
+        BarColumn, DownloadColumn, Progress, TextColumn,
+        TimeRemainingColumn, TransferSpeedColumn,
+    )
+    from rich.prompt import Prompt
 except ImportError:
-    print(json.dumps({"error": "yt-dlp not installed. Run: pip install yt-dlp"}))
-    sys.exit(1)
+    sys.exit("missing deps -> pip install -U yt-dlp rich")
+
+console = Console()
+
+QUALITY_FMT = {
+    "best": "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[vcodec^=avc]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+    "1080": "bestvideo[vcodec^=avc1][height<=1080]+bestaudio/bestvideo+bestaudio/best",
+    "720":  "bestvideo[vcodec^=avc1][height<=720]+bestaudio/bestvideo+bestaudio/best",
+    "480":  "bestvideo[vcodec^=avc1][height<=480]+bestaudio/bestvideo+bestaudio/best",
+}
+DEFAULT_DIR = Path.home() / "Videos" / "fetch"
+OUTTMPL = "%(uploader,channel,creator|unknown)s - %(title).100s [%(id)s].%(ext)s"
 
 
-def progress_hook(d):
-    if d["status"] == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        downloaded = d.get("downloaded_bytes", 0)
-        if total > 0:
-            percent = min(85.0, (downloaded / total) * 85)
-            print(f"PROGRESS:{percent:.1f}", flush=True)
-        else:
-            print("PROGRESS:0", flush=True)
-    elif d["status"] == "finished":
-        print("PROGRESS:85", flush=True)
-        print(f"DONE:{d.get('filename', '')}", flush=True)
+class Settings:
+    def __init__(self):
+        self.outdir = DEFAULT_DIR
+        self.quality = "best"
+        self.audio = False
+        self.playlist = False
+        self.cookies_browser = None
+
+    def ensure(self):
+        self.outdir.mkdir(parents=True, exist_ok=True)
+
+
+class UI:
+    def __init__(self):
+        self.progress = Progress(
+            TextColumn("{task.description}", justify="left"),
+            BarColumn(bar_width=None), DownloadColumn(),
+            TransferSpeedColumn(), TimeRemainingColumn(),
+            console=console,
+        )
+        self.tasks: dict[str, int] = {}
+
+    def hook(self, d):
+        info = d.get("info_dict") or {}
+        key = str(info.get("id") or d.get("filename") or "item")
+        desc = (info.get("title") or "download")[:64]
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+
+        if d["status"] == "downloading":
+            tid = self.tasks.get(key)
+            if tid is None:
+                tid = self.progress.add_task(f"[cyan]{desc}[/]", total=total)
+                self.tasks[key] = tid
+            self.progress.update(
+                tid,
+                completed=d.get("downloaded_bytes") or 0,
+                total=total or self.progress.tasks[tid].total,
+            )
+        elif d["status"] == "finished":
+            tid = self.tasks.get(key)
+            if tid is not None:
+                self.progress.update(
+                    tid,
+                    completed=self.progress.tasks[tid].total or 0,
+                    description=f"[green]{desc}[/] [dim]· downloaded[/]",
+                )
 
 
 def find_ffmpeg():
-    """Find ffmpeg executable (PATH or common Windows locations)."""
     exe = shutil.which("ffmpeg")
     if exe:
         return exe
-    # common fallbacks on Windows if PATH not refreshed
     candidates = [
         Path(os.environ.get("USERPROFILE", "")) / "ffmpeg" / "bin" / "ffmpeg.exe",
         Path("C:/ffmpeg/bin/ffmpeg.exe"),
-        Path(__file__).resolve().parent / "ffmpeg-9.0.2-essentials_build" / "bin" / "ffmpeg.exe",
         Path(__file__).resolve().parent / "ffmpeg" / "bin" / "ffmpeg.exe",
     ]
     for c in candidates:
@@ -55,31 +99,7 @@ def find_ffmpeg():
     return None
 
 
-def probe_codec(ffmpeg: str, path: str) -> str:
-    try:
-        r = subprocess.run(
-            [
-                ffmpeg.replace("ffmpeg", "ffprobe") if "ffmpeg" in ffmpeg else "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return (r.stdout or "").strip().lower()
-    except Exception:
-        return ""
-
-
-def reencode_h264(ffmpeg: str, src: str) -> tuple:
-    """
-    Force re-encode to H.264 + AAC.
-    Returns (output_path, error_or_None).
-    """
+def reencode_h264(ffmpeg: str, src: str) -> tuple[str, str | None]:
     src_path = Path(src)
     if not src_path.is_file():
         return src, f"file not found: {src}"
@@ -87,14 +107,9 @@ def reencode_h264(ffmpeg: str, src: str) -> tuple:
     out = src_path.with_name(src_path.stem + "_h264.mp4")
     cmd = [
         ffmpeg, "-y", "-i", str(src_path),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ac", "2",
-        "-movflags", "+faststart",
-        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        "-movflags", "+faststart", "-pix_fmt", "yuv420p",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         str(out),
     ]
@@ -103,13 +118,12 @@ def reencode_h264(ffmpeg: str, src: str) -> tuple:
         if proc.returncode != 0 or not out.is_file():
             err = (proc.stderr or proc.stdout or "ffmpeg failed")[-800:]
             return src, err
-        # remove original if different
         try:
             if src_path.resolve() != out.resolve() and src_path.exists():
                 src_path.unlink()
         except OSError:
             pass
-        # rename to clean .mp4 name
+        
         final = src_path.with_suffix(".mp4")
         if final.resolve() != out.resolve():
             if final.exists():
@@ -123,144 +137,216 @@ def reencode_h264(ffmpeg: str, src: str) -> tuple:
         return src, str(e)
 
 
-def resolve_downloaded_file(filename: str, output_dir: str) -> str:
-    if filename and os.path.exists(filename):
-        return filename
-    base = os.path.splitext(filename or "")[0]
-    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3"):
-        cand = base + ext
-        if os.path.exists(cand):
-            return cand
-    files = sorted(
-        Path(output_dir).glob("*"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for f in files:
-        if f.is_file() and f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-            return str(f)
-    return filename
+def build_opts(s: Settings, ui: UI) -> dict:
+    opts = {
+        "format": QUALITY_FMT[s.quality] if not s.audio else "bestaudio/best",
+        "outtmpl": str(s.outdir / OUTTMPL),
+        "noplaylist": not s.playlist,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "concurrent_fragment_downloads": 4,
+        "progress_hooks": [ui.hook],
+        "retries": 5,
+        "fragment_retries": 5,
+        "windowsfilenames": True,
+        "merge_output_format": "mp4",
+    }
+    if s.audio:
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    if s.cookies_browser:
+        opts["cookiesfrombrowser"] = (s.cookies_browser,)
+    return opts
 
 
-def download(url: str, fmt: str, output_dir: str = "downloads") -> dict:
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+def first_line(text: str, limit: int = 160) -> str:
+    line = (text or "").strip().splitlines()[0] if text else ""
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def collect_paths(info) -> list[str]:
+    if not info:
+        return []
+    if "entries" in info:
+        out: list[str] = []
+        for entry in info["entries"]:
+            out += collect_paths(entry)
+        return out
+    paths = [d["filepath"] for d in (info.get("requested_downloads") or []) if d.get("filepath")]
+    if not paths and info.get("filepath"):
+        paths.append(info["filepath"])
+    return paths
+
+
+def run(urls: list[str], s: Settings) -> int:
     ffmpeg = find_ffmpeg()
+    ui = UI()
+    done: list[str] = []
+    failures = 0
 
-    if fmt == "mp3":
-        if not ffmpeg:
-            return {
-                "success": False,
-                "error": "ffmpeg not found. Add ffmpeg\\bin to PATH and reopen terminal.",
-            }
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": os.path.join(output_dir, "%(title).80B.%(ext)s"),
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-            "progress_hooks": [progress_hook],
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-        }
-    else:
-        ydl_opts = {
-            "format": (
-                "bestvideo[vcodec^=avc1]+bestaudio/"
-                "bestvideo[vcodec^=avc]+bestaudio/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/best"
-            ),
-            "outtmpl": os.path.join(output_dir, "%(title).80B.%(ext)s"),
-            "merge_output_format": "mp4",
-            "progress_hooks": [progress_hook],
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-        }
+    with ui.progress:
+        for url in urls:
+            try:
+                with yt_dlp.YoutubeDL(build_opts(s, ui)) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                paths = collect_paths(info)
+                
+                if s.audio:
+                    done += paths
+                else:
+                    for p in paths:
+                        tid = ui.progress.add_task(f"[yellow]Đang ép H.264: {Path(p).name}[/]", total=100)
+                        ui.progress.update(tid, completed=50)
+                        
+                        out_path, err = reencode_h264(ffmpeg, p)
+                        if err:
+                            console.print(f"[red]x[/] Lỗi transcode: {first_line(err)}")
+                            done.append(p)
+                        else:
+                            done.append(out_path)
+                            
+                        ui.progress.update(
+                            tid, completed=100, 
+                            description=f"[green]H.264 Done: {Path(out_path).name}[/]"
+                        )
+                        
+            except Exception as e:
+                failures += 1
+                console.print(f"[red]x[/] {url} — {type(e).__name__}: {first_line(str(e))}")
+
+    for p in done:
+        console.print(f"[green]ok[/] {p}")
+    if done:
+        console.print(f"[dim]{len(done)} file(s) -> {s.outdir}[/]")
+    return failures
+
+
+def banner():
+    console.print(Panel.fit(
+        "[bold]fetch[/] [dim]·[/] youtube / tiktok -> local files\n"
+        "[dim]:s settings  ·  :o folder  ·  :q quit[/]",
+        border_style="cyan", padding=(0, 2),
+    ))
+
+
+def state_line(s: Settings):
+    mode = "audio · mp3" if s.audio else f"video · mp4 (H.264)"
+    console.print(
+        f"[dim]→[/] {s.outdir}  [dim]·[/]  {mode}  [dim]·[/]  "
+        f"playlist {'on' if s.playlist else 'off'}"
+    )
+
+
+def settings_menu(s: Settings):
+    while True:
+        console.print(
+            f"\n[dim]settings[/]  quality [bold]{s.quality}[/] · "
+            f"mode [bold]{'audio (mp3)' if s.audio else 'video (mp4)'}[/] · "
+            f"playlist [bold]{'on' if s.playlist else 'off'}[/] · "
+            f"cookies [bold]{s.cookies_browser or 'off'}[/]"
+        )
+        key = Prompt.ask(
+            "[dim]q[/]uality [dim]m[/]ode [dim]f[/]older [dim]p[/]laylist "
+            "[dim]c[/]ookies [dim]b[/]ack",
+            choices=["q", "m", "f", "p", "c", "b"], default="b",
+        )
+        if key == "q":
+            s.quality = Prompt.ask("quality", choices=list(QUALITY_FMT), default=s.quality)
+        elif key == "m":
+            choice = Prompt.ask("mode", choices=["video", "audio"],
+                                default="audio" if s.audio else "video")
+            s.audio = choice == "audio"
+        elif key == "f":
+            s.outdir = Path(Prompt.ask("folder", default=str(s.outdir))).expanduser()
+            s.ensure()
+        elif key == "p":
+            s.playlist = not s.playlist
+        elif key == "c":
+            b = Prompt.ask("browser (chrome/firefox/edge/safari, empty = off)",
+                           default=s.cookies_browser or "")
+            s.cookies_browser = b.strip() or None
+        else:
+            return
+
+
+def interactive(s: Settings):
+    banner()
+    
+    if not find_ffmpeg():
+        console.print("\n[bold red]CẢNH BÁO:[/] Không tìm thấy ffmpeg. Không thể ép H.264 hoặc tách MP3!\n")
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "download")
-            filename = ydl.prepare_filename(info)
+        while True:
+            # Bước 1: Chọn định dạng
+            console.print("\n[bold cyan]Chọn định dạng tải:[/]")
+            console.print("  [1] MP4 (Video - Tự động ép H.264)")
+            console.print("  [2] MP3 (Audio)")
+            console.print("  [q] Thoát")
+            mode = Prompt.ask("Lựa chọn", choices=["1", "2", "q"], default="1")
+            
+            if mode.lower() == "q":
+                console.print("[dim]bye[/]")
+                return
+                
+            s.audio = (mode == "2")
+            
+            # Bước 2: Nhập URL
+            state_line(s)
+            raw = Prompt.ask("[bold cyan]url[/]", default="", show_default=False).strip()
+            
+            if raw in {":q", "q", "quit", "exit"}:
+                console.print("[dim]bye[/]")
+                return
+            if raw == ":s":
+                settings_menu(s)
+                continue
+            if raw == ":o":
+                console.print(str(s.outdir))
+                continue
+                
+            urls = [u for u in re.split(r"[\s,]+", raw) if re.match(r"https?://", u)]
+            if not urls:
+                console.print("[yellow]no valid url in that[/]")
+                continue
+                
+            # Bước 3: Tải (sau khi xong sẽ tự vòng lên Bước 1)
+            run(urls, s)
+            console.print()
+            
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[dim]bye[/]")
+        return
 
-            if fmt == "mp3":
-                base = os.path.splitext(filename)[0]
-                filename = base + ".mp3"
-                if not os.path.exists(filename):
-                    filename = resolve_downloaded_file(filename, output_dir)
-                print("PROGRESS:100", flush=True)
-                return {
-                    "success": True,
-                    "title": title,
-                    "filename": filename,
-                    "format": "mp3",
-                    "codec": "mp3",
-                    "ffmpeg": bool(ffmpeg),
-                }
 
-            filename = resolve_downloaded_file(filename, output_dir)
-            print("PROGRESS:88", flush=True)
-
-            if not ffmpeg:
-                print("PROGRESS:100", flush=True)
-                return {
-                    "success": True,
-                    "title": title,
-                    "filename": filename,
-                    "format": "mp4",
-                    "codec": "unknown",
-                    "ffmpeg": False,
-                    "warning": "ffmpeg not found — file may be HEVC. Install ffmpeg and re-download.",
-                }
-
-            print("PROGRESS:90", flush=True)
-            out_path, err = reencode_h264(ffmpeg, filename)
-            print("PROGRESS:100", flush=True)
-
-            if err:
-                return {
-                    "success": True,
-                    "title": title,
-                    "filename": out_path,
-                    "format": "mp4",
-                    "codec": "unknown",
-                    "ffmpeg": True,
-                    "warning": f"re-encode failed, original kept: {err[:200]}",
-                }
-
-            return {
-                "success": True,
-                "title": title,
-                "filename": out_path,
-                "format": "mp4",
-                "codec": "h264",
-                "ffmpeg": True,
-            }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+def parse_args():
+    ap = argparse.ArgumentParser(prog="fetch", description="local YouTube/TikTok downloader")
+    ap.add_argument("urls", nargs="*", help="one or more video urls")
+    ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_DIR)
+    ap.add_argument("-q", "--quality", choices=list(QUALITY_FMT), default="best")
+    ap.add_argument("-a", "--audio", action="store_true", help="extract mp3")
+    ap.add_argument("-p", "--playlist", action="store_true", help="download whole playlist")
+    ap.add_argument("--cookies-from-browser", default=None)
+    return ap.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Media Downloader")
-    parser.add_argument("url", help="URL to download")
-    parser.add_argument("--format", choices=["mp4", "mp3"], default="mp4")
-    parser.add_argument("--output", default="downloads")
-    args = parser.parse_args()
+    args = parse_args()
+    s = Settings()
+    s.outdir = args.outdir.expanduser()
+    s.quality = args.quality
+    s.audio = args.audio
+    s.playlist = args.playlist
+    s.cookies_browser = args.cookies_from_browser
+    s.ensure()
 
-    # quick self-check printed to stderr so it does not break JSON stdout
-    ff = find_ffmpeg()
-    print(f"[check] ffmpeg={ff or 'NOT FOUND'}", file=sys.stderr, flush=True)
+    if args.urls:
+        raise SystemExit(1 if run(args.urls, s) else 0)
 
-    result = download(args.url, args.format, args.output)
-    print(json.dumps(result, ensure_ascii=False), flush=True)
-    if not result.get("success"):
-        sys.exit(1)
+    interactive(s)
 
 
 if __name__ == "__main__":
