@@ -1,353 +1,314 @@
-#!/usr/bin/env python3
-# fetch.py — local YouTube/TikTok downloader. clean TUI + CLI.
-# deps:  pip install -U yt-dlp rich
-# needs: ffmpeg on PATH (hoặc thả folder ffmpeg cạnh file này)
-from __future__ import annotations
-
-import argparse
-import os
+from http.server import BaseHTTPRequestHandler
+import json
 import re
-import shutil
-import subprocess
 import sys
-from pathlib import Path
-
-try:
-    import yt_dlp
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.progress import (
-        BarColumn, DownloadColumn, Progress, TextColumn,
-        TimeRemainingColumn, TransferSpeedColumn,
-    )
-    from rich.prompt import Prompt
-except ImportError:
-    sys.exit("missing deps -> pip install -U yt-dlp rich")
-
-console = Console()
-
-QUALITY_FMT = {
-    "best": "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[vcodec^=avc]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    "1080": "bestvideo[vcodec^=avc1][height<=1080]+bestaudio/bestvideo+bestaudio/best",
-    "720":  "bestvideo[vcodec^=avc1][height<=720]+bestaudio/bestvideo+bestaudio/best",
-    "480":  "bestvideo[vcodec^=avc1][height<=480]+bestaudio/bestvideo+bestaudio/best",
-}
-DEFAULT_DIR = Path.home() / "Videos" / "fetch"
-OUTTMPL = "%(uploader,channel,creator|unknown)s - %(title).100s [%(id)s].%(ext)s"
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
 
 
-class Settings:
-    def __init__(self):
-        self.outdir = DEFAULT_DIR
-        self.quality = "best"
-        self.audio = False
-        self.playlist = False
-        self.cookies_browser = None
-
-    def ensure(self):
-        self.outdir.mkdir(parents=True, exist_ok=True)
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 
 
-class UI:
-    def __init__(self):
-        self.progress = Progress(
-            TextColumn("{task.description}", justify="left"),
-            BarColumn(bar_width=None), DownloadColumn(),
-            TransferSpeedColumn(), TimeRemainingColumn(),
-            console=console,
-        )
-        self.tasks: dict[str, int] = {}
-
-    def hook(self, d):
-        info = d.get("info_dict") or {}
-        key = str(info.get("id") or d.get("filename") or "item")
-        desc = (info.get("title") or "download")[:64]
-        total = d.get("total_bytes") or d.get("total_bytes_estimate")
-
-        if d["status"] == "downloading":
-            tid = self.tasks.get(key)
-            if tid is None:
-                tid = self.progress.add_task(f"[cyan]{desc}[/]", total=total)
-                self.tasks[key] = tid
-            self.progress.update(
-                tid,
-                completed=d.get("downloaded_bytes") or 0,
-                total=total or self.progress.tasks[tid].total,
-            )
-        elif d["status"] == "finished":
-            tid = self.tasks.get(key)
-            if tid is not None:
-                self.progress.update(
-                    tid,
-                    completed=self.progress.tasks[tid].total or 0,
-                    description=f"[green]{desc}[/] [dim]· downloaded[/]",
-                )
-
-
-def find_ffmpeg():
-    exe = shutil.which("ffmpeg")
-    if exe:
-        return exe
-    candidates = [
-        Path(os.environ.get("USERPROFILE", "")) / "ffmpeg" / "bin" / "ffmpeg.exe",
-        Path("C:/ffmpeg/bin/ffmpeg.exe"),
-        Path(__file__).resolve().parent / "ffmpeg" / "bin" / "ffmpeg.exe",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return str(c)
-    return None
-
-
-def reencode_h264(ffmpeg: str, src: str) -> tuple[str, str | None]:
-    src_path = Path(src)
-    if not src_path.is_file():
-        return src, f"file not found: {src}"
-
-    out = src_path.with_name(src_path.stem + "_h264.mp4")
-    cmd = [
-        ffmpeg, "-y", "-i", str(src_path),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-        "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        str(out),
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if proc.returncode != 0 or not out.is_file():
-            err = (proc.stderr or proc.stdout or "ffmpeg failed")[-800:]
-            return src, err
-        try:
-            if src_path.resolve() != out.resolve() and src_path.exists():
-                src_path.unlink()
-        except OSError:
-            pass
-        
-        final = src_path.with_suffix(".mp4")
-        if final.resolve() != out.resolve():
-            if final.exists():
-                final.unlink()
-            out.rename(final)
-            return str(final), None
-        return str(out), None
-    except subprocess.TimeoutExpired:
-        return src, "ffmpeg timeout"
-    except Exception as e:
-        return src, str(e)
-
-
-def build_opts(s: Settings, ui: UI) -> dict:
-    opts = {
-        "format": QUALITY_FMT[s.quality] if not s.audio else "bestaudio/best",
-        "outtmpl": str(s.outdir / OUTTMPL),
-        "noplaylist": not s.playlist,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "concurrent_fragment_downloads": 4,
-        "progress_hooks": [ui.hook],
-        "retries": 5,
-        "fragment_retries": 5,
-        "windowsfilenames": True,
-        "merge_output_format": "mp4",
+def _fetch_json(url, timeout=18, extra_headers=None):
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json, */*",
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+        "Referer": "https://www.tikwm.com/",
+        "Origin": "https://www.tikwm.com",
     }
-    if s.audio:
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
-    if s.cookies_browser:
-        opts["cookiesfrombrowser"] = (s.cookies_browser,)
-    return opts
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
-def first_line(text: str, limit: int = 160) -> str:
-    line = (text or "").strip().splitlines()[0] if text else ""
-    return line if len(line) <= limit else line[: limit - 1] + "…"
+def _safe_name(title):
+    t = re.sub(r'[\\/:*?"<>|\n\r#]+', "_", (title or "download")).strip()
+    t = re.sub(r"_+", "_", t).strip("._ ")
+    return (t[:80] or "download")
 
 
-def collect_paths(info) -> list[str]:
-    if not info:
-        return []
-    if "entries" in info:
-        out: list[str] = []
-        for entry in info["entries"]:
-            out += collect_paths(entry)
-        return out
-    paths = [d["filepath"] for d in (info.get("requested_downloads") or []) if d.get("filepath")]
-    if not paths and info.get("filepath"):
-        paths.append(info["filepath"])
-    return paths
+def _parse_tikwm(data, fmt):
+    """Prefer H.264 (play) over HEVC (hdplay). Return direct CDN URLs."""
+    if not isinstance(data, dict) or data.get("code") != 0:
+        return None, (data or {}).get("msg") or "parse fail"
+    d = data.get("data") or {}
+    title = _safe_name(d.get("title") or d.get("id") or "download")
+
+    if fmt == "mp3":
+        music = d.get("music")
+        if not music and isinstance(d.get("music_info"), dict):
+            music = d["music_info"].get("play")
+        if music:
+            return {
+                "url": music,
+                "filename": f"{title}.mp3",
+                "codec": "audio",
+                "direct": True,
+            }, None
+        return None, "no audio"
+
+    # play â H.264 no-wm; wmplay = with watermark; hdplay often HEVC
+    video = d.get("play") or d.get("wmplay") or d.get("hdplay")
+    codec_hint = "h264"
+    if video and video == d.get("hdplay") and video != d.get("play"):
+        codec_hint = "hevc"
+
+    if video:
+        return {
+            "url": video,
+            "filename": f"{title}.mp4",
+            "codec": codec_hint,
+            "direct": True,
+            "urls": {
+                "play": d.get("play"),
+                "wmplay": d.get("wmplay"),
+                "hdplay": d.get("hdplay"),
+            },
+        }, None
+    return None, "no video"
 
 
-def run(urls: list[str], s: Settings) -> int:
-    ffmpeg = find_ffmpeg()
-    ui = UI()
-    done: list[str] = []
-    failures = 0
-
-    with ui.progress:
-        for url in urls:
-            try:
-                with yt_dlp.YoutubeDL(build_opts(s, ui)) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                paths = collect_paths(info)
-                
-                if s.audio:
-                    done += paths
-                else:
-                    for p in paths:
-                        tid = ui.progress.add_task(f"[yellow]Đang ép H.264: {Path(p).name}[/]", total=100)
-                        ui.progress.update(tid, completed=50)
-                        
-                        out_path, err = reencode_h264(ffmpeg, p)
-                        if err:
-                            console.print(f"[red]x[/] Lỗi transcode: {first_line(err)}")
-                            done.append(p)
-                        else:
-                            done.append(out_path)
-                            
-                        ui.progress.update(
-                            tid, completed=100, 
-                            description=f"[green]H.264 Done: {Path(out_path).name}[/]"
-                        )
-                        
-            except Exception as e:
-                failures += 1
-                console.print(f"[red]x[/] {url} — {type(e).__name__}: {first_line(str(e))}")
-
-    for p in done:
-        console.print(f"[green]ok[/] {p}")
-    if done:
-        console.print(f"[dim]{len(done)} file(s) -> {s.outdir}[/]")
-    return failures
+def _tikwm_candidates(url):
+    q = urllib.parse.urlencode({"url": url, "hd": "1"})
+    c = [
+        "https://www.tikwm.com/api/?" + q,
+        "https://tikwm.com/api/?" + q,
+    ]
+    clean = url.split("?")[0].rstrip("/")
+    if clean != url.rstrip("/"):
+        q2 = urllib.parse.urlencode({"url": clean, "hd": "1"})
+        c.append("https://www.tikwm.com/api/?" + q2)
+    return c
 
 
-def banner():
-    console.print(Panel.fit(
-        "[bold]fetch[/] [dim]·[/] youtube / tiktok -> local files\n"
-        "[dim]:s settings  ·  :o folder  ·  :q quit[/]",
-        border_style="cyan", padding=(0, 2),
-    ))
-
-
-def state_line(s: Settings):
-    mode = "audio · mp3" if s.audio else f"video · mp4 (H.264)"
-    console.print(
-        f"[dim]→[/] {s.outdir}  [dim]·[/]  {mode}  [dim]·[/]  "
-        f"playlist {'on' if s.playlist else 'off'}"
-    )
-
-
-def settings_menu(s: Settings):
-    while True:
-        console.print(
-            f"\n[dim]settings[/]  quality [bold]{s.quality}[/] · "
-            f"mode [bold]{'audio (mp3)' if s.audio else 'video (mp4)'}[/] · "
-            f"playlist [bold]{'on' if s.playlist else 'off'}[/] · "
-            f"cookies [bold]{s.cookies_browser or 'off'}[/]"
-        )
-        key = Prompt.ask(
-            "[dim]q[/]uality [dim]m[/]ode [dim]f[/]older [dim]p[/]laylist "
-            "[dim]c[/]ookies [dim]b[/]ack",
-            choices=["q", "m", "f", "p", "c", "b"], default="b",
-        )
-        if key == "q":
-            s.quality = Prompt.ask("quality", choices=list(QUALITY_FMT), default=s.quality)
-        elif key == "m":
-            choice = Prompt.ask("mode", choices=["video", "audio"],
-                                default="audio" if s.audio else "video")
-            s.audio = choice == "audio"
-        elif key == "f":
-            s.outdir = Path(Prompt.ask("folder", default=str(s.outdir))).expanduser()
-            s.ensure()
-        elif key == "p":
-            s.playlist = not s.playlist
-        elif key == "c":
-            b = Prompt.ask("browser (chrome/firefox/edge/safari, empty = off)",
-                           default=s.cookies_browser or "")
-            s.cookies_browser = b.strip() or None
-        else:
-            return
-
-
-def interactive(s: Settings):
-    banner()
-    
-    if not find_ffmpeg():
-        console.print("\n[bold red]CẢNH BÁO:[/] Không tìm thấy ffmpeg. Không thể ép H.264 hoặc tách MP3!\n")
-
+def _try_tikmate(url, fmt):
+    """Secondary resolver. Best-effort, may break anytime."""
     try:
-        while True:
-            # Bước 1: Chọn định dạng
-            console.print("\n[bold cyan]Chọn định dạng tải:[/]")
-            console.print("  [1] MP4 (Video - Tự động ép H.264)")
-            console.print("  [2] MP3 (Audio)")
-            console.print("  [q] Thoát")
-            mode = Prompt.ask("Lựa chọn", choices=["1", "2", "q"], default="1")
-            
-            if mode.lower() == "q":
-                console.print("[dim]bye[/]")
+        api = "https://api.tikmate.app/api/lookup?" + urllib.parse.urlencode(
+            {"url": url}
+        )
+        data = _fetch_json(
+            api,
+            timeout=12,
+            extra_headers={
+                "Referer": "https://tikmate.app/",
+                "Origin": "https://tikmate.app",
+            },
+        )
+        if not isinstance(data, dict):
+            return None, "tikmate bad payload"
+        token = data.get("token") or data.get("id")
+        if fmt == "mp3":
+            music = data.get("music") or data.get("audio") or data.get("music_url")
+            if music:
+                title = _safe_name(data.get("title") or data.get("desc") or "download")
+                return {
+                    "url": music,
+                    "filename": f"{title}.mp3",
+                    "codec": "audio",
+                    "direct": True,
+                    "source": "tikmate",
+                }, None
+            return None, "tikmate no audio"
+
+        video = (
+            data.get("nwm_video_url")
+            or data.get("video_url")
+            or data.get("play")
+            or data.get("url")
+        )
+        if not video and token:
+            video = f"https://tikmate.app/download/{token}.mp4"
+        if video:
+            title = _safe_name(data.get("title") or data.get("desc") or "download")
+            return {
+                "url": video,
+                "filename": f"{title}.mp4",
+                "codec": "h264",
+                "direct": True,
+                "source": "tikmate",
+            }, None
+        return None, "tikmate no video"
+    except Exception as e:
+        return None, f"tikmate: {type(e).__name__}"
+
+
+def download_media(url, fmt):
+    errors = []
+
+    for api_url in _tikwm_candidates(url):
+        for attempt in range(2):
+            try:
+                data = _fetch_json(api_url, timeout=16)
+                result, err = _parse_tikwm(data, fmt)
+                if result:
+                    result["source"] = "tikwm"
+                    return {"success": True, **result}
+                errors.append(err or "unknown")
+            except Exception as e:
+                errors.append(str(e))
+            time.sleep(0.35 * (attempt + 1))
+
+    result, err = _try_tikmate(url, fmt)
+    if result:
+        return {"success": True, **result}
+    if err:
+        errors.append(err)
+
+    is_tt = any(
+        x in url.lower()
+        for x in ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "douyin.com")
+    )
+    if not is_tt:
+        return {
+            "success": False,
+            "error": "Nguá»n nÃ y (YouTube/khÃ¡c) cáº§n yt-dlp backend. TrÃªn Vercel hiá»n há» trá»£ tá»t nháº¥t lÃ  TikTok.",
+            "hint": "DÃ¹ng link TikTok Äáº§y Äá»§ dáº¡ng https://www.tiktok.com/@user/video/ID",
+        }
+
+    return {
+        "success": False,
+        "error": "KhÃ´ng táº£i ÄÆ°á»£c video. " + (errors[0] if errors else "API lá»i."),
+        "hint": "Thá»­ láº¡i sau vÃ i giÃ¢y, hoáº·c dÃ¹ng link dáº¡ng /@user/video/1234567890",
+        "details": errors[:4],
+    }
+
+
+def _proxy_file(handler, media_url, filename, fmt):
+    """Optional stream proxy for browsers that block cross-origin download."""
+    headers = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Referer": "https://www.tiktok.com/",
+    }
+    req = urllib.request.Request(media_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            content_type = resp.headers.get("Content-Type") or (
+                "audio/mpeg" if fmt == "mp3" else "video/mp4"
+            )
+            chunks = []
+            total = 0
+            max_bytes = 40 * 1024 * 1024
+            while True:
+                block = resp.read(64 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > max_bytes:
+                    handler._json(
+                        413,
+                        {
+                            "success": False,
+                            "error": "File quÃ¡ lá»n Äá» proxy (~40MB). DÃ¹ng táº£i trá»±c tiáº¿p.",
+                        },
+                    )
+                    return
+                chunks.append(block)
+            data = b"".join(chunks)
+
+        safe = _safe_name(filename) or ("download.mp3" if fmt == "mp3" else "download.mp4")
+        if not safe.lower().endswith((".mp4", ".mp3", ".m4a")):
+            safe += ".mp3" if fmt == "mp3" else ".mp4"
+
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{safe}"; filename*=UTF-8\'\'{urllib.parse.quote(safe)}',
+        )
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Cache-Control", "no-store")
+        handler._cors()
+        handler.end_headers()
+        handler.wfile.write(data)
+    except urllib.error.HTTPError as e:
+        handler._json(502, {"success": False, "error": f"CDN lá»i {e.code}. Thá»­ láº¡i sau vÃ i giÃ¢y."})
+    except Exception as e:
+        handler._json(502, {"success": False, "error": f"Proxy fail: {type(e).__name__}: {e}"})
+
+
+class handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if qs.get("proxy", [""])[0] != "1":
+                self._json(
+                    400,
+                    {
+                        "success": False,
+                        "error": "Use POST to resolve, or GET ?proxy=1&url=... to stream",
+                    },
+                )
                 return
-                
-            s.audio = (mode == "2")
-            
-            # Bước 2: Nhập URL
-            state_line(s)
-            raw = Prompt.ask("[bold cyan]url[/]", default="", show_default=False).strip()
-            
-            if raw in {":q", "q", "quit", "exit"}:
-                console.print("[dim]bye[/]")
+            media_url = (qs.get("url") or [""])[0].strip()
+            filename = (qs.get("name") or ["download.mp4"])[0]
+            fmt = (qs.get("format") or ["mp4"])[0].lower()
+            if not media_url or not re.match(r"^https?://", media_url, re.I):
+                self._json(400, {"success": False, "error": "Missing media url"})
                 return
-            if raw == ":s":
-                settings_menu(s)
-                continue
-            if raw == ":o":
-                console.print(str(s.outdir))
-                continue
-                
-            urls = [u for u in re.split(r"[\s,]+", raw) if re.match(r"https?://", u)]
-            if not urls:
-                console.print("[yellow]no valid url in that[/]")
-                continue
-                
-            # Bước 3: Tải (sau khi xong sẽ tự vòng lên Bước 1)
-            run(urls, s)
-            console.print()
-            
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n[dim]bye[/]")
-        return
+            _proxy_file(self, media_url, filename, fmt)
+        except Exception as e:
+            self._json(500, {"success": False, "error": f"{type(e).__name__}: {e}"})
 
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 50_000:
+                self._json(413, {"success": False, "error": "Body quÃ¡ lá»n"})
+                return
+            body = self.rfile.read(length) if length else b""
+            data = json.loads(body.decode("utf-8")) if body else {}
+            url = (data.get("url") or "").strip()
+            fmt = (data.get("format") or "mp4").lower()
 
-def parse_args():
-    ap = argparse.ArgumentParser(prog="fetch", description="local YouTube/TikTok downloader")
-    ap.add_argument("urls", nargs="*", help="one or more video urls")
-    ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_DIR)
-    ap.add_argument("-q", "--quality", choices=list(QUALITY_FMT), default="best")
-    ap.add_argument("-a", "--audio", action="store_true", help="extract mp3")
-    ap.add_argument("-p", "--playlist", action="store_true", help="download whole playlist")
-    ap.add_argument("--cookies-from-browser", default=None)
-    return ap.parse_args()
+            if not url:
+                self._json(400, {"success": False, "error": "Missing URL"})
+                return
+            if fmt not in ("mp4", "mp3"):
+                self._json(400, {"success": False, "error": "Format must be mp4 or mp3"})
+                return
+            if not re.match(r"^https?://", url, re.I):
+                self._json(400, {"success": False, "error": "URL pháº£i báº¯t Äáº§u báº±ng http/https"})
+                return
 
+            result = download_media(url, fmt)
+            code = 200 if result.get("success") else 422
+            self._json(code, result)
+        except Exception as e:
+            self._json(500, {"success": False, "error": f"{type(e).__name__}: {e}"})
 
-def main():
-    args = parse_args()
-    s = Settings()
-    s.outdir = args.outdir.expanduser()
-    s.quality = args.quality
-    s.audio = args.audio
-    s.playlist = args.playlist
-    s.cookies_browser = args.cookies_from_browser
-    s.ensure()
-
-    if args.urls:
-        raise SystemExit(1 if run(args.urls, s) else 0)
-
-    interactive(s)
-
-
-if __name__ == "__main__":
-    main()
+    def _json(self, code, obj):
+        try:
+            payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception:
+            pass
